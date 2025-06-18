@@ -6,7 +6,9 @@
 
 ;; Data Maps and Variables
 (define-data-var last-token-id uint u0)
+(define-data-var last-exhibition-id uint u0)
 (define-data-var mint-price uint u100000000) ;; Set in microSTX (0.1 STX)
+(define-data-var contract-owner principal tx-sender)
 
 ;; Creature Attributes
 (define-map creature-attributes
@@ -43,15 +45,44 @@
         creature-id: uint,
         start-time: uint,
         duration: uint,
-        votes: uint
+        votes: uint,
+        active: bool
     }
 )
+
+;; Voting tracking to prevent double voting
+(define-map exhibition-votes
+    { exhibition-id: uint, voter: principal }
+    bool
+)
+
+;; Battle system
+(define-map battles
+    uint
+    {
+        challenger: principal,
+        defender: principal,
+        challenger-creature: uint,
+        defender-creature: uint,
+        winner: (optional principal),
+        battle-time: uint,
+        completed: bool
+    }
+)
+
+(define-data-var last-battle-id uint u0)
 
 ;; Error Constants
 (define-constant ERR-NOT-AUTHORIZED (err u101))
 (define-constant ERR-CREATURE-NOT-FOUND (err u102))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u103))
 (define-constant ERR-EXHIBITION-ACTIVE (err u104))
+(define-constant ERR-ALREADY-VOTED (err u105))
+(define-constant ERR-EXHIBITION-NOT-FOUND (err u106))
+(define-constant ERR-BATTLE-NOT-FOUND (err u107))
+(define-constant ERR-BATTLE-ALREADY-COMPLETED (err u108))
+(define-constant ERR-CANNOT-BATTLE-SELF (err u109))
+(define-constant ERR-INVALID-INPUT (err u110))
 
 ;; Random Helper Functions
 (define-private (get-random-uint (max uint))
@@ -119,6 +150,28 @@
     (+ u1 (get-random-uint u1000))
 )
 
+;; Admin functions
+(define-private (is-contract-owner)
+    (is-eq tx-sender (var-get contract-owner))
+)
+
+(define-public (set-mint-price (new-price uint))
+    (begin
+        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-price u0) ERR-INVALID-INPUT)
+        (var-set mint-price new-price)
+        (ok new-price)
+    )
+)
+
+(define-public (transfer-ownership (new-owner principal))
+    (begin
+        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (var-set contract-owner new-owner)
+        (ok new-owner)
+    )
+)
+
 ;; Update artist statistics
 (define-private (update-artist-stats (artist principal))
     (let
@@ -148,6 +201,9 @@
             (new-id (+ (var-get last-token-id) u1))
             (creator tx-sender)
         )
+        ;; Input validation
+        (asserts! (> (len art-style) u0) ERR-INVALID-INPUT)
+
         ;; Check payment
         (try! (stx-transfer? (var-get mint-price) tx-sender (as-contract tx-sender)))
 
@@ -200,55 +256,81 @@
     (let
         (
             (curator tx-sender)
-            (exhibition-id (+ (var-get last-token-id) u1))
+            (new-exhibition-id (+ (var-get last-exhibition-id) u1))
         )
+        ;; Input validation
+        (asserts! (> duration u0) ERR-INVALID-INPUT)
+
         ;; Check if the curator owns the creature
-        (asserts! (is-eq (unwrap! (nft-get-owner? artherealms-creature creature-id) (err ERR-CREATURE-NOT-FOUND)) curator)
-            (err ERR-NOT-AUTHORIZED))
+        (asserts! (is-eq (unwrap! (nft-get-owner? artherealms-creature creature-id) ERR-CREATURE-NOT-FOUND) curator)
+            ERR-NOT-AUTHORIZED)
 
         ;; Create the exhibition
-        (map-set exhibitions exhibition-id
+        (map-set exhibitions new-exhibition-id
             {
                 curator: curator,
                 creature-id: creature-id,
                 start-time: block-height,
                 duration: duration,
-                votes: u0
+                votes: u0,
+                active: true
             }
         )
 
+        ;; Update exhibition counter
+        (var-set last-exhibition-id new-exhibition-id)
+
         ;; Update the creature's exhibition count
         (match (map-get? creature-attributes creature-id)
-            creature-info 
+            creature-info
             (begin
-                (map-set creature-attributes creature-id 
+                (map-set creature-attributes creature-id
                     (merge creature-info { exhibitions-held: (+ (get exhibitions-held creature-info) u1) }))
-                (ok exhibition-id)
+                (ok new-exhibition-id)
             )
-            (err ERR-CREATURE-NOT-FOUND)
+            ERR-CREATURE-NOT-FOUND
         )
     )
 )
 
 ;; Vote for an exhibition
 (define-public (vote-for-exhibition (exhibition-id uint))
-    (match (map-get? exhibitions exhibition-id)
-        exhibition 
-        (let
-            (
-                (updated-votes (+ (get votes exhibition) u1))
-            )
-            (map-set exhibitions exhibition-id (merge exhibition { votes: updated-votes }))
-            (ok updated-votes)
+    (let
+        (
+            (voter tx-sender)
+            (vote-key { exhibition-id: exhibition-id, voter: voter })
         )
-        (err ERR-CREATURE-NOT-FOUND)
+        ;; Check if user already voted
+        (asserts! (is-none (map-get? exhibition-votes vote-key)) ERR-ALREADY-VOTED)
+
+        (match (map-get? exhibitions exhibition-id)
+            exhibition
+            (let
+                (
+                    (updated-votes (+ (get votes exhibition) u1))
+                    (start-time (get start-time exhibition))
+                    (duration (get duration exhibition))
+                )
+                ;; Check if exhibition is still active
+                (asserts! (get active exhibition) ERR-EXHIBITION-ACTIVE)
+                (asserts! (< block-height (+ start-time duration)) ERR-EXHIBITION-ACTIVE)
+
+                ;; Record the vote
+                (map-set exhibition-votes vote-key true)
+
+                ;; Update exhibition votes
+                (map-set exhibitions exhibition-id (merge exhibition { votes: updated-votes }))
+                (ok updated-votes)
+            )
+            ERR-EXHIBITION-NOT-FOUND
+        )
     )
 )
 
 ;; End an exhibition
 (define-public (end-exhibition (exhibition-id uint))
     (match (map-get? exhibitions exhibition-id)
-        exhibition 
+        exhibition
         (let
             (
                 (curator (get curator exhibition))
@@ -258,24 +340,208 @@
                 (votes (get votes exhibition))
             )
             ;; Check if the exhibition has ended
-            (asserts! (>= block-height (+ start-time duration)) (err ERR-EXHIBITION-ACTIVE))
+            (asserts! (>= block-height (+ start-time duration)) ERR-EXHIBITION-ACTIVE)
+            (asserts! (get active exhibition) ERR-EXHIBITION-ACTIVE)
 
             ;; Update artist stats
             (match (map-get? artist-stats curator)
-                artist-info 
+                artist-info
                 (begin
-                    (map-set artist-stats curator 
-                        (merge artist-info { 
+                    (map-set artist-stats curator
+                        (merge artist-info {
                             exhibition-score: (+ (get exhibition-score artist-info) votes),
                             reputation: (+ (get reputation artist-info) u10)
                         }))
-                    ;; Remove the exhibition
-                    (map-delete exhibitions exhibition-id)
+                    ;; Mark exhibition as inactive instead of deleting
+                    (map-set exhibitions exhibition-id (merge exhibition { active: false }))
                     (ok votes)
                 )
-                (err ERR-NOT-AUTHORIZED)
+                ERR-NOT-AUTHORIZED
             )
         )
-        (err ERR-CREATURE-NOT-FOUND)
+        ERR-EXHIBITION-NOT-FOUND
     )
+)
+
+;; Battle System Functions
+
+;; Challenge another creature to battle
+(define-public (challenge-to-battle (challenger-creature-id uint) (defender-creature-id uint))
+    (let
+        (
+            (challenger tx-sender)
+            (new-battle-id (+ (var-get last-battle-id) u1))
+        )
+        ;; Input validation
+        (asserts! (not (is-eq challenger-creature-id defender-creature-id)) ERR-CANNOT-BATTLE-SELF)
+
+        ;; Check if challenger owns the creature
+        (asserts! (is-eq (unwrap! (nft-get-owner? artherealms-creature challenger-creature-id) ERR-CREATURE-NOT-FOUND) challenger)
+            ERR-NOT-AUTHORIZED)
+
+        ;; Get defender info
+        (let
+            (
+                (defender (unwrap! (nft-get-owner? artherealms-creature defender-creature-id) ERR-CREATURE-NOT-FOUND))
+            )
+            ;; Cannot battle yourself
+            (asserts! (not (is-eq challenger defender)) ERR-CANNOT-BATTLE-SELF)
+
+            ;; Create battle
+            (map-set battles new-battle-id
+                {
+                    challenger: challenger,
+                    defender: defender,
+                    challenger-creature: challenger-creature-id,
+                    defender-creature: defender-creature-id,
+                    winner: none,
+                    battle-time: block-height,
+                    completed: false
+                }
+            )
+
+            ;; Update battle counter
+            (var-set last-battle-id new-battle-id)
+
+            (ok new-battle-id)
+        )
+    )
+)
+
+;; Resolve battle (can be called by either participant)
+(define-public (resolve-battle (battle-id uint))
+    (match (map-get? battles battle-id)
+        battle
+        (let
+            (
+                (challenger (get challenger battle))
+                (defender (get defender battle))
+                (challenger-creature (get challenger-creature battle))
+                (defender-creature (get defender-creature battle))
+            )
+            ;; Check if battle is already completed
+            (asserts! (not (get completed battle)) ERR-BATTLE-ALREADY-COMPLETED)
+
+            ;; Only participants can resolve
+            (asserts! (or (is-eq tx-sender challenger) (is-eq tx-sender defender)) ERR-NOT-AUTHORIZED)
+
+            ;; Get creature stats for battle calculation
+            (let
+                (
+                    (challenger-stats (unwrap! (map-get? creature-attributes challenger-creature) ERR-CREATURE-NOT-FOUND))
+                    (defender-stats (unwrap! (map-get? creature-attributes defender-creature) ERR-CREATURE-NOT-FOUND))
+                    (challenger-power (+ (get art-power challenger-stats) (get creativity challenger-stats) (get rarity challenger-stats)))
+                    (defender-power (+ (get art-power defender-stats) (get creativity defender-stats) (get rarity defender-stats)))
+                    (random-factor (get-random-uint u100))
+                    (challenger-wins (> (+ challenger-power random-factor) defender-power))
+                    (winner (if challenger-wins challenger defender))
+                    (winner-creature (if challenger-wins challenger-creature defender-creature))
+                )
+                ;; Update battle result
+                (map-set battles battle-id (merge battle { winner: (some winner), completed: true }))
+
+                ;; Update winner's creature stats
+                (map-set creature-attributes winner-creature
+                    (merge (if challenger-wins challenger-stats defender-stats)
+                        { battles-won: (+ (get battles-won (if challenger-wins challenger-stats defender-stats)) u1) }))
+
+                ;; Update artist stats
+                (match (map-get? artist-stats winner)
+                    winner-stats
+                    (map-set artist-stats winner
+                        (merge winner-stats {
+                            total-battles: (+ (get total-battles winner-stats) u1),
+                            reputation: (+ (get reputation winner-stats) u5)
+                        }))
+                    true
+                )
+
+                (ok winner)
+            )
+        )
+        ERR-BATTLE-NOT-FOUND
+    )
+)
+
+;; Evolution System
+
+;; Evolve creature (requires certain conditions)
+(define-public (evolve-creature (creature-id uint))
+    (let
+        (
+            (owner tx-sender)
+        )
+        ;; Check ownership
+        (asserts! (is-eq (unwrap! (nft-get-owner? artherealms-creature creature-id) ERR-CREATURE-NOT-FOUND) owner)
+            ERR-NOT-AUTHORIZED)
+
+        (match (map-get? creature-attributes creature-id)
+            creature-info
+            (let
+                (
+                    (current-level (get evolution-level creature-info))
+                    (battles-won (get battles-won creature-info))
+                    (exhibitions-held (get exhibitions-held creature-info))
+                )
+                ;; Evolution requirements: at least 3 battles won and 2 exhibitions held
+                (asserts! (>= battles-won u3) ERR-INSUFFICIENT-FUNDS)
+                (asserts! (>= exhibitions-held u2) ERR-INSUFFICIENT-FUNDS)
+                (asserts! (< current-level u5) ERR-INVALID-INPUT) ;; Max level 5
+
+                ;; Evolution cost increases with level
+                (let
+                    (
+                        (evolution-cost (* current-level u50000000)) ;; 0.05 STX per level
+                    )
+                    (try! (stx-transfer? evolution-cost tx-sender (as-contract tx-sender)))
+
+                    ;; Upgrade creature stats
+                    (map-set creature-attributes creature-id
+                        (merge creature-info {
+                            evolution-level: (+ current-level u1),
+                            art-power: (+ (get art-power creature-info) u10),
+                            creativity: (+ (get creativity creature-info) u8),
+                            rarity: (+ (get rarity creature-info) u5)
+                        }))
+
+                    (ok (+ current-level u1))
+                )
+            )
+            ERR-CREATURE-NOT-FOUND
+        )
+    )
+)
+
+;; Additional Read-Only Functions
+
+;; Get exhibition details
+(define-read-only (get-exhibition-details (exhibition-id uint))
+    (match (map-get? exhibitions exhibition-id)
+        exhibition-info (ok exhibition-info)
+        ERR-EXHIBITION-NOT-FOUND
+    )
+)
+
+;; Get battle details
+(define-read-only (get-battle-details (battle-id uint))
+    (match (map-get? battles battle-id)
+        battle-info (ok battle-info)
+        ERR-BATTLE-NOT-FOUND
+    )
+)
+
+;; Check if user has voted for exhibition
+(define-read-only (has-voted (exhibition-id uint) (voter principal))
+    (is-some (map-get? exhibition-votes { exhibition-id: exhibition-id, voter: voter }))
+)
+
+;; Get contract info
+(define-read-only (get-contract-info)
+    (ok {
+        total-creatures: (var-get last-token-id),
+        total-exhibitions: (var-get last-exhibition-id),
+        total-battles: (var-get last-battle-id),
+        mint-price: (var-get mint-price),
+        contract-owner: (var-get contract-owner)
+    })
 )
